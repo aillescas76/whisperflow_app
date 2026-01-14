@@ -1,0 +1,315 @@
+# Tasks: Whisperflow-Like CLI App
+
+This document turns `doc/REQUIREMENTS.md` and `doc/ARCHITECTURE.md` into a
+step-by-step implementation plan for a junior developer. Each task includes
+goal, files, steps, and acceptance criteria. Follow the tasks in order.
+
+Assumptions:
+- Work is offline. Models are cached under `/opt/faster-whisper/models`.
+- Use `/usr/local/bin/faster-whisper-gpu` as the only transcription backend.
+- Default config file is `config/config.json`.
+
+## [ ] Task 0: Project layout and baseline docs
+
+Goal: Establish a minimal folder layout and developer-facing usage notes.
+ls
+Files:
+- `README.md` (new)
+- `config/config.json` (new)
+- `doc/USAGE.md` (new)
+
+Steps:
+1) Create `README.md` with a short app overview and links to docs.
+2) Create `config/config.json` using the defaults from `doc/REQUIREMENTS.md`.
+3) Create `doc/USAGE.md` with example CLI commands for `start`, `stop`,
+   `status`, and file-based transcription.
+
+Acceptance criteria:
+- `config/config.json` exists and matches the schema in requirements.
+- `README.md` and `doc/USAGE.md` are readable and short (no code yet).
+
+## [ ] Task 0b: Add `pyproject.toml` baseline
+
+Goal: Introduce a minimal, explicit project config file for Python tooling.
+
+Files:
+- `pyproject.toml` (new)
+
+Steps:
+1) Create a minimal `pyproject.toml` with project name, version, and Python
+   requirement.
+2) Add placeholders for tooling config if needed later (keep minimal).
+
+Acceptance criteria:
+- `pyproject.toml` exists with valid TOML syntax.
+- No tool-specific configuration is required to run current tasks.
+
+## [ ] Task 1: Config loader and validation
+
+Goal: Load config defaults, validate expected fields, and allow CLI overrides.
+
+Files:
+- `whisperflow/config.py` (new)
+- `whisperflow/errors.py` (new)
+
+Steps:
+1) Create `whisperflow/config.py` with a function:
+   - `load_config(path: str) -> dict`
+2) Implement validation to ensure required keys exist and types are reasonable.
+   - Include audio capture fields needed for rolling buffer / VAD and backend
+     selection per `doc/linux_audio_capture_python.md`.
+3) Add helpers for safe defaults if keys are missing.
+4) Create `whisperflow/errors.py` with custom exception types:
+   - `ConfigError`, `UserInputError`, `RuntimeError`
+
+Acceptance criteria:
+- Missing/invalid config raises a clear `ConfigError`.
+- `load_config` returns a merged config dict with defaults.
+- No network calls or external dependencies.
+
+## [ ] Task 2: CLI entrypoint and command routing
+
+Goal: Provide a CLI entrypoint that supports commands: `start`, `stop`,
+`status`, `transcribe`, and `batch`.
+
+Files:
+- `whisperflow/cli.py` (new)
+- `whisperflow/__main__.py` (new)
+
+Steps:
+1) Implement a basic CLI parser (argparse is fine).
+2) Commands:
+   - `start`: start live capture via daemon (Task 5).
+   - `stop`: stop live capture via daemon (Task 6).
+   - `status`: show daemon status (Task 6).
+   - `transcribe`: file-based transcription (Task 3).
+   - `batch`: process a folder (Task 4).
+3) Add options for model, language, task, output_format, output_dir.
+4) Wire CLI to call the right functions (stub if needed).
+
+Acceptance criteria:
+- `python -m whisperflow --help` shows all commands and options.
+- Invalid arguments produce a clear error message.
+
+## [ ] Task 3: File-based transcription wrapper
+
+Goal: Run `faster-whisper-gpu` for a single file and write outputs.
+
+Files:
+- `whisperflow/transcribe.py` (new)
+
+Steps:
+1) Implement `run_transcribe(input_path: str, config: dict, overrides: dict)`.
+2) Validate input file exists and is a supported format (use extension check).
+3) Build a subprocess command using only supported options:
+   - `--model`, `--language`, `--task`, `--output_format`, `--output_dir`
+4) Run the command, capture stdout/stderr, and raise a `RuntimeError` on failure.
+5) Return output file paths to the caller for reporting.
+
+Acceptance criteria:
+- Missing input file raises `UserInputError`.
+- The command uses `/usr/local/bin/faster-whisper-gpu` directly.
+- Output is placed under `output_dir`.
+
+## [ ] Task 4: Batch transcription
+
+Goal: Transcribe all audio files in a folder using Task 3.
+
+Files:
+- `whisperflow/batch.py` (new)
+
+Steps:
+1) Implement `run_batch(input_dir: str, config: dict, overrides: dict)`.
+2) Discover files by extension; skip unsupported ones and report them.
+3) For each file, call `run_transcribe`.
+4) Collect and return a summary of successes and failures.
+
+Acceptance criteria:
+- Invalid folder path raises `UserInputError`.
+- Batch prints a short summary at the end.
+
+## [ ] Task 5: Audio capture and live transcription loop
+
+Goal: Capture mic audio, feed it to the transcription pipeline, and append a
+raw transcript to disk as capture runs.
+
+Files:
+- `whisperflow/audio.py` (new)
+- `whisperflow/live.py` (new)
+
+Steps:
+1) Implement mic capture in `whisperflow/audio.py`:
+   - Follow `doc/linux_audio_capture_python.md` for capture design.
+   - Prefer `sounddevice` (PortAudio) for capture; if unavailable, allow a
+     CLI fallback such as `arecord` or `pw-record`.
+   - Use config fields: device, sample_rate, channels, chunk_ms.
+   - Output chunks as float32 or WAV/PCM bytes suitable for Faster-Whisper.
+2) Implement live loop in `whisperflow/live.py`:
+   - Initialize `raw_transcript_file` path.
+   - Use a rolling buffer + VAD/silence detection to avoid 1s hard chunking.
+   - When silence is detected, call a lightweight transcription step on the
+     buffered phrase.
+   - Append to raw transcript file.
+3) Keep the loop cancellable (stop signal passed in from daemon).
+
+Acceptance criteria:
+- While running, raw transcript grows on disk.
+- Capture cleanly stops on signal without crashing.
+
+Note:
+- If incremental transcription is complex, implement a buffer-first approach
+  with a silence threshold (see `doc/linux_audio_capture_python.md`).
+
+## [ ] Task 6: Daemon process and IPC
+
+Goal: Implement the local daemon and IPC so `start`, `stop`, `status` work.
+
+Files:
+- `whisperflow/daemon.py` (new)
+- `whisperflow/ipc.py` (new)
+- `run/` (new directory, created at runtime)
+
+Steps:
+1) Implement a daemon process that owns capture state.
+2) Use a Unix socket in `./run/whisperflow.sock`.
+3) Create state files:
+   - `./run/whisperflow.pid`
+   - `./run/whisperflow.state.json` (paths, config, status)
+4) `start`:
+   - Launch daemon if not running.
+   - Begin capture and update state.
+5) `stop`:
+   - Send stop signal via IPC.
+   - Daemon finalizes transcript and updates state.
+6) `status`:
+   - Read state and display human-readable status.
+   - Include capture backend and device details if available (see
+     `doc/linux_audio_capture_python.md`).
+
+Acceptance criteria:
+- `start` launches daemon once (no duplicates).
+- `stop` finalizes and exits cleanly.
+- `status` works even if daemon is not running.
+
+## [ ] Task 7: Output writer and clipboard integration
+
+Goal: Write final transcript to disk and copy to clipboard.
+
+Files:
+- `whisperflow/output.py` (new)
+- `whisperflow/clipboard.py` (new)
+
+Steps:
+1) Implement `write_transcript(text: str, path: str)`.
+2) Implement clipboard tool detection in `clipboard.py`:
+   - Prefer `xclip`, then `xsel`, then `wl-copy` if available.
+3) Add a `copy_to_clipboard(text: str)` helper.
+4) Wire this into daemon finalization step (Task 6).
+
+Acceptance criteria:
+- Final transcript is written to `final_transcript_filename`.
+- Clipboard copy is skipped with a clear warning if no tool is available.
+
+## [ ] Task 8: Optional post-processing
+
+Goal: Add a placeholder hook for LLM enrichment without requiring network.
+
+Files:
+- `whisperflow/postprocess.py` (new)
+
+Steps:
+1) Implement `postprocess(text: str, config: dict) -> str`.
+2) If `postprocess.enabled` is false, return text unchanged.
+3) If enabled, check for a local provider config; if missing, raise a clear error.
+
+Acceptance criteria:
+- No network calls.
+- Clear error message if user enables it without setup.
+
+## [ ] Task 9: Tests and validation
+
+Goal: Provide lightweight validation to ensure key parts work.
+
+Files:
+- `tests/` (new)
+
+Steps:
+1) Add unit tests for config loading and validation.
+   - Cover audio capture defaults and VAD/rolling buffer fields (see
+     `doc/linux_audio_capture_python.md`).
+2) Add a test for CLI argument parsing (help output and errors).
+3) Add a small fake for `faster-whisper-gpu` to test command assembly.
+4) Use `uv run pytest` for testing (auto-creates a venv) and note its usage.
+5) Add `pyproject.toml` tool configuration if needed for the chosen test runner.
+
+Acceptance criteria:
+- Tests run without network or model files.
+- Clear instructions in `doc/USAGE.md` on running tests.
+
+## [ ] Task 10: Error handling and user-facing messages
+
+Goal: Ensure all errors are explicit and actionable.
+
+Files:
+- `whisperflow/errors.py` (update)
+- `whisperflow/cli.py` (update)
+
+Steps:
+1) Standardize error messages for:
+   - Missing file
+   - Unsupported format
+   - Failed subprocess
+   - Missing config
+2) Wrap CLI entrypoint with a top-level error handler.
+3) Exit with non-zero codes on errors.
+
+Acceptance criteria:
+- Common errors are obvious and readable.
+- CLI returns non-zero exit code on failure.
+
+## [ ] Task 11: Final docs and handoff
+
+Goal: Ensure a junior developer can run and operate the app.
+
+Files:
+- `README.md` (update)
+- `doc/USAGE.md` (update)
+- `doc/WORK_SUMMARY.md` (new)
+
+Steps:
+1) Update `README.md` with install, run, and troubleshooting notes.
+   - Reference capture dependencies and tuning guidance from
+     `doc/linux_audio_capture_python.md`.
+2) Expand `doc/USAGE.md` with real examples (paths, formats, output_dir).
+3) Create `doc/WORK_SUMMARY.md` using the template below.
+
+Acceptance criteria:
+- Docs are consistent with CLI options and config.
+- Work summary exists and is filled after implementation.
+
+---
+
+# Work Summary Template (fill after tasks are done)
+
+File: `doc/WORK_SUMMARY.md`
+
+Use this format:
+
+```
+# Work Summary
+
+## What was built
+- ...
+
+## Key files added or changed
+- ...
+
+## How to run
+- ...
+
+## Known limitations or follow-ups
+- ...
+
+## Verification
+- ...
+```

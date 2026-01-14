@@ -1,0 +1,33 @@
+{
+  "output_dir": "./output",
+  "model": "medium",
+  "language": "auto",
+  "task": "transcribe",
+  "output_format": "txt",
+  "batch": false,
+  "live_capture": {
+    "enabled": true,
+    "raw_transcript_filename": "live_raw.txt",
+    "final_transcript_filename": "transcript.txt",
+    "audio": {
+      "device": "default",
+      "sample_rate": 16000,
+      "channels": 1,
+      "chunk_ms": 1000
+    }
+  },
+  "postprocess": {
+    "enabled": false,
+    "provider": "llm",
+    "profile": "default"
+  },
+  "clipboard": {
+    "enabled": true,
+    "tool": "auto"
+  },
+  "logging": {
+    "level": "INFO",
+    "console": true,
+    "file": ""
+  }
+}

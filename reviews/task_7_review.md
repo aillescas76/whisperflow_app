@@ -1,0 +1,1 @@
+Review written to `reviews/task_7_review.md` with prioritized risks, test gaps, and a small style note. No code changes made and no tests run.
