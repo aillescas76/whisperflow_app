@@ -50,10 +50,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "tool": "auto",
     },
+    "web": {
+        "enabled": True,
+        "host": "127.0.0.1",
+        "port": 8787,
+    },
     "logging": {
         "level": "INFO",
         "console": True,
-        "file": "",
+        "file": "./logs/whisperflow.log",
     },
 }
 
@@ -77,7 +82,9 @@ def load_config(path: str) -> dict[str, Any]:
     return merged
 
 
-def apply_overrides(config: dict[str, Any], overrides: dict[str, Any] | None) -> dict[str, Any]:
+def apply_overrides(
+    config: dict[str, Any], overrides: dict[str, Any] | None
+) -> dict[str, Any]:
     """Merge CLI overrides into an existing config dictionary."""
     if overrides is None:
         return copy.deepcopy(config)
@@ -134,6 +141,11 @@ def _validate_config(config: dict[str, Any]) -> None:
     _validate_bool(clipboard, "enabled")
     _validate_str(clipboard, "tool")
 
+    web_config = _require_dict(config, "web")
+    _validate_bool(web_config, "enabled")
+    _validate_str(web_config, "host")
+    _validate_port(web_config, "port")
+
     logging_config = _require_dict(config, "logging")
     _validate_str(logging_config, "level", allowed=ALLOWED_LOG_LEVELS)
     _validate_bool(logging_config, "console")
@@ -175,7 +187,9 @@ def _validate_bool(parent: dict[str, Any], key: str) -> None:
         raise ConfigError(f"Config key '{key}' must be a boolean.")
 
 
-def _validate_int(parent: dict[str, Any], key: str, *, min_value: int | None = None) -> None:
+def _validate_int(
+    parent: dict[str, Any], key: str, *, min_value: int | None = None
+) -> None:
     value = parent.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"Config key '{key}' must be an integer.")
@@ -183,7 +197,16 @@ def _validate_int(parent: dict[str, Any], key: str, *, min_value: int | None = N
         raise ConfigError(f"Config key '{key}' must be >= {min_value}.")
 
 
-def _validate_float(parent: dict[str, Any], key: str, *, min_value: float | None = None) -> None:
+def _validate_port(parent: dict[str, Any], key: str) -> None:
+    _validate_int(parent, key, min_value=1)
+    value = parent.get(key)
+    if isinstance(value, int) and value > 65535:
+        raise ConfigError(f"Config key '{key}' must be <= 65535.")
+
+
+def _validate_float(
+    parent: dict[str, Any], key: str, *, min_value: float | None = None
+) -> None:
     value = parent.get(key)
     if isinstance(value, bool) or not isinstance(value, (float, int)):
         raise ConfigError(f"Config key '{key}' must be a number.")

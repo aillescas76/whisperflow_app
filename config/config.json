@@ -25,9 +25,14 @@
     "enabled": true,
     "tool": "auto"
   },
+  "web": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8787
+  },
   "logging": {
     "level": "INFO",
     "console": true,
-    "file": ""
+    "file": "./logs/whisperflow.log"
   }
 }

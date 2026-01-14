@@ -5,15 +5,17 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import select
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 from whisperflow.errors import WhisperflowRuntimeError
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class AudioChunk:
@@ -47,7 +49,34 @@ def open_audio_capture(
     """Create an audio capture backend based on configuration."""
     resolved = _resolve_backend(backend)
     if resolved == "sounddevice":
-        return _SoundDeviceCapture(device, sample_rate, channels, chunk_ms)
+        resolved_device = device
+        default_source = None
+        if device == "default":
+            system_device = _resolve_system_default_device()
+            if system_device is not None:
+                resolved_device = system_device
+                logger.info(
+                    "Resolved system default input device to %s.", system_device
+                )
+            else:
+                default_source = _pactl_default_source()
+                if _should_use_pipewire(default_source):
+                    if shutil.which("pw-record") is not None:
+                        logger.info(
+                            "Falling back to pw-record for bluetooth source '%s'.",
+                            default_source,
+                        )
+                        command = _build_pw_record_command(
+                            sample_rate, channels, target=default_source
+                        )
+                        return _SubprocessCapture(
+                            command, sample_rate, channels, chunk_ms
+                        )
+                    logger.warning(
+                        "Bluetooth source '%s' detected but pw-record is unavailable.",
+                        default_source,
+                    )
+        return _SoundDeviceCapture(resolved_device, sample_rate, channels, chunk_ms)
     if resolved == "arecord":
         command = _build_arecord_command(device, sample_rate, channels)
         return _SubprocessCapture(command, sample_rate, channels, chunk_ms)
@@ -60,9 +89,13 @@ def open_audio_capture(
 def _resolve_backend(backend: str) -> str:
     if backend != "auto":
         if backend == "sounddevice" and not _sounddevice_available():
-            raise WhisperflowRuntimeError("sounddevice backend requested but the package is not available.")
+            raise WhisperflowRuntimeError(
+                "sounddevice backend requested but the package is not available."
+            )
         if backend in {"arecord", "pw-record"} and shutil.which(backend) is None:
-            raise WhisperflowRuntimeError(f"{backend} backend requested but the executable is not available.")
+            raise WhisperflowRuntimeError(
+                f"{backend} backend requested but the executable is not available."
+            )
         return backend
 
     if _sounddevice_available():
@@ -71,7 +104,9 @@ def _resolve_backend(backend: str) -> str:
         return "arecord"
     if shutil.which("pw-record") is not None:
         return "pw-record"
-    raise WhisperflowRuntimeError("No supported audio capture backend is available (sounddevice, arecord, pw-record).")
+    raise WhisperflowRuntimeError(
+        "No supported audio capture backend is available (sounddevice, arecord, pw-record)."
+    )
 
 
 def _sounddevice_available() -> bool:
@@ -82,7 +117,209 @@ def _sounddevice_available() -> bool:
     return True
 
 
-def _default_sounddevice_samplerate(sounddevice_module, device: Optional[str | int]) -> int | None:
+def _should_use_pipewire(default_source: str | None) -> bool:
+    if not default_source:
+        return False
+    return default_source.startswith("bluez_input")
+
+
+def _resolve_system_default_device() -> str | int | None:
+    default_source = _pactl_default_source()
+    if not default_source:
+        return None
+    metadata = _pactl_source_metadata(default_source)
+    try:
+        import sounddevice as sd
+    except ImportError:
+        return None
+
+    description = metadata.get("description")
+    device_description = metadata.get("device_description")
+    product_name = metadata.get("product_name")
+    card_name = metadata.get("card_name")
+    long_card_name = metadata.get("long_card_name")
+
+    devices = list(sd.query_devices())
+    best_index: int | None = None
+    best_name = ""
+    best_score = 0
+    is_bluez = default_source.startswith("bluez_input")
+
+    logger.info("System default source: %s", default_source)
+    for index, device in enumerate(devices):
+        if not isinstance(device, dict):
+            continue
+        max_inputs = device.get("max_input_channels", 0)
+        if not isinstance(max_inputs, int) or max_inputs <= 0:
+            continue
+        name = str(device.get("name", ""))
+        normalized_name = _normalize_token(name)
+        score = _score_device_match(
+            default_source,
+            description,
+            device_description,
+            product_name,
+            card_name,
+            long_card_name,
+            device_name=name,
+        )
+        if (
+            device_description
+            and _normalize_token(device_description) == normalized_name
+        ):
+            score += 10
+        if description and _normalize_token(description) == normalized_name:
+            score += 6
+        if is_bluez and "bluetooth" in normalized_name:
+            score += 4
+        if score > best_score:
+            best_index = index
+            best_score = score
+            best_name = name
+
+    if best_score == 0 and is_bluez:
+        fallback_tokens = _collect_tokens(description, device_description, product_name)
+        for index, device in enumerate(devices):
+            if not isinstance(device, dict):
+                continue
+            max_inputs = device.get("max_input_channels", 0)
+            if not isinstance(max_inputs, int) or max_inputs <= 0:
+                continue
+            name = str(device.get("name", ""))
+            normalized_name = _normalize_token(name)
+            if "bluetooth" not in normalized_name:
+                continue
+            if any(token in normalized_name for token in fallback_tokens):
+                best_index = index
+                best_name = name
+                best_score = 1
+                logger.info(
+                    "Fallback bluetooth match for '%s' resolved to %s (%s).",
+                    default_source,
+                    best_index,
+                    best_name,
+                )
+                break
+
+    if best_score == 0:
+        logger.warning(
+            "Unable to map system default source '%s' to a sounddevice input.",
+            default_source,
+        )
+        _log_sounddevice_inputs(devices)
+        return None
+
+    logger.info(
+        "Mapped default source '%s' to sounddevice input %s (%s).",
+        default_source,
+        best_index,
+        best_name,
+    )
+    return best_index
+
+
+def _log_sounddevice_inputs(devices: list[Any]) -> None:
+    inputs = []
+    for index, device in enumerate(devices):
+        if not isinstance(device, dict):
+            continue
+        max_inputs = device.get("max_input_channels", 0)
+        if not isinstance(max_inputs, int) or max_inputs <= 0:
+            continue
+        name = str(device.get("name", ""))
+        inputs.append(f"{index}: {name}")
+    if inputs:
+        logger.warning("Available sounddevice inputs: %s", "; ".join(inputs))
+
+
+def _pactl_default_source() -> str | None:
+    try:
+        result = subprocess.run(
+            ["pactl", "info"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("Default Source:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _pactl_source_metadata(source_name: str) -> dict[str, str]:
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "sources"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    metadata: dict[str, str] = {}
+    in_block = False
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Source #"):
+            in_block = False
+        if stripped.startswith("Name:"):
+            in_block = stripped.split(":", 1)[1].strip() == source_name
+        if not in_block:
+            continue
+        if stripped.startswith("Description:"):
+            metadata["description"] = stripped.split(":", 1)[1].strip()
+        if stripped.startswith("device.description ="):
+            metadata["device_description"] = (
+                stripped.split("=", 1)[1].strip().strip('"')
+            )
+        if stripped.startswith("device.product.name ="):
+            metadata["product_name"] = stripped.split("=", 1)[1].strip().strip('"')
+        if stripped.startswith("alsa.card_name ="):
+            metadata["card_name"] = stripped.split("=", 1)[1].strip().strip('"')
+        if stripped.startswith("alsa.long_card_name ="):
+            metadata["long_card_name"] = stripped.split("=", 1)[1].strip().strip('"')
+    return metadata
+
+
+def _score_device_match(*candidates: str | None, device_name: str) -> int:
+    normalized_name = _normalize_token(device_name)
+    score = 0
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized_candidate = _normalize_token(candidate)
+        if not normalized_candidate:
+            continue
+        if normalized_candidate in normalized_name:
+            score += 5
+        for token in _tokenize(candidate):
+            if token in normalized_name:
+                score += 1
+    return score
+
+
+def _normalize_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _tokenize(value: str) -> list[str]:
+    tokens = re.split(r"[^a-z0-9]+", value.lower())
+    return [token for token in tokens if len(token) > 2]
+
+
+def _collect_tokens(*values: str | None) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        tokens.extend(_tokenize(value))
+    return list(dict.fromkeys(tokens))
+
+
+def _default_sounddevice_samplerate(
+    sounddevice_module, device: Optional[str | int]
+) -> int | None:
     try:
         info = sounddevice_module.query_devices(device, "input")
     except sounddevice_module.PortAudioError:
@@ -95,7 +332,9 @@ def _default_sounddevice_samplerate(sounddevice_module, device: Optional[str | i
     return int(default_rate)
 
 
-def _build_arecord_command(device: str | int, sample_rate: int, channels: int) -> list[str]:
+def _build_arecord_command(
+    device: str | int, sample_rate: int, channels: int
+) -> list[str]:
     command = [
         "arecord",
         "-q",
@@ -114,8 +353,10 @@ def _build_arecord_command(device: str | int, sample_rate: int, channels: int) -
     return command
 
 
-def _build_pw_record_command(sample_rate: int, channels: int) -> list[str]:
-    return [
+def _build_pw_record_command(
+    sample_rate: int, channels: int, target: str | None = None
+) -> list[str]:
+    command = [
         "pw-record",
         "--rate",
         str(sample_rate),
@@ -124,12 +365,17 @@ def _build_pw_record_command(sample_rate: int, channels: int) -> list[str]:
         "--format",
         "s16",
         "--raw",
-        "-",
     ]
+    if target:
+        command.extend(["--target", target])
+    command.append("-")
+    return command
 
 
 class _SoundDeviceCapture:
-    def __init__(self, device: str | int, sample_rate: int, channels: int, chunk_ms: int) -> None:
+    def __init__(
+        self, device: str | int, sample_rate: int, channels: int, chunk_ms: int
+    ) -> None:
         self._device = device
         self._sample_rate = sample_rate
         self._channels = channels
@@ -140,7 +386,9 @@ class _SoundDeviceCapture:
     def start(self) -> None:
         import sounddevice as sd
 
-        device_value: Optional[str | int] = None if self._device == "default" else self._device
+        device_value: Optional[str | int] = (
+            None if self._device == "default" else self._device
+        )
         frames_per_chunk = max(1, int(self._sample_rate * self._chunk_ms / 1000))
 
         def callback(indata, _frames, _time, _status) -> None:
@@ -170,7 +418,9 @@ class _SoundDeviceCapture:
         except sd.PortAudioError as exc:
             fallback_rate = _default_sounddevice_samplerate(sd, device_value)
             if fallback_rate is None or fallback_rate == self._sample_rate:
-                raise WhisperflowRuntimeError(f"Failed to open audio input: {exc}") from exc
+                raise WhisperflowRuntimeError(
+                    f"Failed to open audio input: {exc}"
+                ) from exc
             logger.warning(
                 "Sounddevice sample rate %s unsupported; falling back to %s.",
                 self._sample_rate,
@@ -193,7 +443,9 @@ class _SoundDeviceCapture:
             data = self._queue.get(timeout=timeout)
         except queue.Empty:
             return None
-        return AudioChunk(data=data, sample_rate=self._sample_rate, channels=self._channels)
+        return AudioChunk(
+            data=data, sample_rate=self._sample_rate, channels=self._channels
+        )
 
     def stop(self) -> None:
         if self._stream is None:
@@ -228,7 +480,9 @@ class _SubprocessCapture:
                 stderr=subprocess.PIPE,
             )
         except FileNotFoundError as exc:
-            raise WhisperflowRuntimeError(f"Audio capture executable not found: {self._command[0]}") from exc
+            raise WhisperflowRuntimeError(
+                f"Audio capture executable not found: {self._command[0]}"
+            ) from exc
         if self._process.stdout is not None:
             self._stdout_fd = self._process.stdout.fileno()
 
@@ -238,7 +492,11 @@ class _SubprocessCapture:
         if self._process.poll() is not None:
             stderr = ""
             if self._process.stderr is not None:
-                stderr = self._process.stderr.read().decode("utf-8", errors="replace").strip()
+                stderr = (
+                    self._process.stderr.read()
+                    .decode("utf-8", errors="replace")
+                    .strip()
+                )
             message = stderr or "Audio capture process exited unexpectedly."
             raise WhisperflowRuntimeError(message)
         if self._stdout_fd is None:
@@ -250,7 +508,9 @@ class _SubprocessCapture:
             try:
                 data = os.read(self._stdout_fd, self._chunk_bytes - len(self._buffer))
             except OSError as exc:
-                raise WhisperflowRuntimeError(f"Failed to read audio capture output: {exc}") from exc
+                raise WhisperflowRuntimeError(
+                    f"Failed to read audio capture output: {exc}"
+                ) from exc
             if not data:
                 return None
             self._buffer.extend(data)
@@ -259,7 +519,9 @@ class _SubprocessCapture:
 
         data = bytes(self._buffer[: self._chunk_bytes])
         del self._buffer[: self._chunk_bytes]
-        return AudioChunk(data=data, sample_rate=self._sample_rate, channels=self._channels)
+        return AudioChunk(
+            data=data, sample_rate=self._sample_rate, channels=self._channels
+        )
 
     def stop(self) -> None:
         if self._process is None:

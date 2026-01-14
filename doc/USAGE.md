@@ -1,6 +1,6 @@
 # Usage
 
-This app is CLI-only. All commands are run from the project root.
+This app is CLI-first with an optional local web dashboard. All commands are run from the project root.
 
 ## Help
 
@@ -43,6 +43,13 @@ Live capture outputs:
 - Raw transcript: `./output/live_raw.txt`
 - Final transcript on stop: `./output/transcript.txt`
 - Per-segment files: `./output/live_segments/`
+- On start, existing transcript files are backed up with a timestamp suffix.
+
+## Live dashboard
+
+When `web.enabled` is true, the daemon serves a local dashboard at
+`http://127.0.0.1:8787` with chunk timing stats and recent segments. Configure
+`web.host` and `web.port` to change the bind address.
 
 ## File-based transcription
 
@@ -85,6 +92,11 @@ Supported audio extensions: `.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`, `.opus`,
 
 Defaults live in `config/config.json`. CLI flags override config values.
 Live capture tuning lives under `live_capture.audio` and `live_capture.vad`.
+
+Web dashboard options live under `web`:
+- `enabled`: `true` to start the local server
+- `host`: bind address (default `127.0.0.1`)
+- `port`: bind port (default `8787`)
 
 Logging options live under `logging`:
 - `level`: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`

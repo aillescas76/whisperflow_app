@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -22,6 +23,7 @@ from whisperflow.ipc import send_command, serve
 from whisperflow.live import run_live_capture
 from whisperflow.logging_utils import setup_logging
 from whisperflow.output import write_transcript
+from whisperflow.web_dashboard import LiveDashboard, start_dashboard_server
 
 RUN_DIR = Path("run")
 SOCKET_PATH = RUN_DIR / "whisperflow.sock"
@@ -41,7 +43,9 @@ def start_daemon(config: dict[str, Any]) -> None:
     _ensure_run_dir()
     if _daemon_running():
         pid = _read_pid()
-        message = f"Daemon already running (pid {pid})." if pid else "Daemon already running."
+        message = (
+            f"Daemon already running (pid {pid})." if pid else "Daemon already running."
+        )
         print(message)
         return
 
@@ -103,6 +107,8 @@ def show_status() -> None:
     _print_state_line(state, "language", "Language")
     _print_state_line(state, "task", "Task")
     _print_state_line(state, "output_format", "Output format")
+    _print_state_line(state, "web_url", "Web dashboard")
+    _print_state_line(state, "web_error", "Web error")
     _print_state_line(state, "started_at", "Started")
     _print_state_line(state, "stopped_at", "Stopped")
     _print_state_line(state, "last_error", "Last error")
@@ -130,10 +136,25 @@ def _run_daemon(config_path: Path) -> None:
             state.update(updates)
             _write_state(state)
 
+    dashboard: LiveDashboard | None = None
+    web_server: ThreadingHTTPServer | None = None
+    web_config = config.get("web", {})
+    if isinstance(web_config, dict) and web_config.get("enabled", False):
+        dashboard = LiveDashboard(config)
+        host = web_config.get("host", "127.0.0.1")
+        port = int(web_config.get("port", 8787))
+        try:
+            web_server = start_dashboard_server(dashboard, stop_event, host, port)
+            update_state(web_url=f"http://{host}:{port}")
+        except OSError as exc:
+            logger.warning("Failed to start dashboard on %s:%s: %s", host, port, exc)
+            update_state(web_error=str(exc))
+            dashboard = None
+
     def capture_worker() -> None:
         try:
             update_state(status="running")
-            run_live_capture(config, {}, stop_event)
+            run_live_capture(config, {}, stop_event, dashboard)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Capture worker crashed: %s", exc)
             update_state(status="error", last_error=str(exc))
@@ -157,6 +178,8 @@ def _run_daemon(config_path: Path) -> None:
     serve(SOCKET_PATH, stop_event, handle_request)
 
     capture_thread.join()
+    if web_server:
+        web_server.server_close()
     _finalize_transcript(state, config, update_state)
     update_state(status="stopped", stopped_at=_now_iso())
     logger.info("Daemon stopped.")
@@ -186,11 +209,15 @@ def _build_state(config: dict[str, Any]) -> dict[str, Any]:
         "language": config["language"],
         "task": config["task"],
         "output_format": config["output_format"],
+        "web_url": None,
+        "web_error": None,
         "last_error": None,
     }
 
 
-def _finalize_transcript(state: dict[str, Any], config: dict[str, Any], update_state: Any) -> None:
+def _finalize_transcript(
+    state: dict[str, Any], config: dict[str, Any], update_state: Any
+) -> None:
     raw_path = Path(state["raw_transcript_path"])
     final_path = Path(state["final_transcript_path"])
     try:
@@ -333,7 +360,9 @@ def _now_iso() -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the Whisperflow daemon process."""
     parser = argparse.ArgumentParser(description="Whisperflow daemon process.")
-    parser.add_argument("--config", required=True, help="Path to the daemon config JSON file.")
+    parser.add_argument(
+        "--config", required=True, help="Path to the daemon config JSON file."
+    )
     args = parser.parse_args(argv)
 
     config_path = Path(args.config)

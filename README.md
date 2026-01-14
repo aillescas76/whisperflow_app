@@ -18,6 +18,7 @@ Notes:
 - Models must be cached under `/opt/faster-whisper/models`.
 - Logging is configured via `logging.level`, `logging.console`, and `logging.file`
   in `config/config.json`.
+- Live dashboard is available at `http://127.0.0.1:8787` when `web.enabled` is true.
 
 Install:
 - Python 3.10+ is required.
