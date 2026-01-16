@@ -27,12 +27,23 @@ Install:
   - Python deps (installs into `.venv`): `uv pip install sounddevice numpy`
 - If you do not want `sounddevice`, install `arecord` or `pw-record` and set
   `live_capture.backend` to `arecord` or `pw-record`.
+- System tray indicator on KDE (AppIndicator):
+  - System deps: `sudo apt install libayatana-appindicator3-1 gir1.2-ayatanaappindicator3-0 libgtk-3-0 libnotify-bin`
+  - Python deps: `uv pip install .[tray]`
 
 Run:
 - Show CLI help: `uv run python -m whisperflow --help`
 - Transcribe a file: `uv run python -m whisperflow transcribe /path/to/audio.wav --output_dir ./output`
 - Start live capture: `uv run python -m whisperflow start`
 - Stop live capture: `uv run python -m whisperflow stop`
+
+Shortcut scripts (repo root):
+- Spanish capture: `scripts/start_capture_es.sh`
+- English capture: `scripts/start_capture_en.sh`
+- Stop capture: `scripts/stop_capture.sh`
+
+Keyboard shortcut setup (Ubuntu/Kubuntu/Tuxedo OS):
+- See `doc/USAGE.md` for suggested keybindings and step-by-step setup.
 
 Usage example:
 ```bash

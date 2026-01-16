@@ -20,9 +20,11 @@ from whisperflow.clipboard import copy_to_clipboard
 from whisperflow.config import load_config
 from whisperflow.errors import WhisperflowRuntimeError
 from whisperflow.ipc import send_command, serve
-from whisperflow.live import run_live_capture
+from whisperflow.live import run_live_capture, run_output_capture
 from whisperflow.logging_utils import setup_logging
+from whisperflow.notify import send_notification
 from whisperflow.output import write_transcript
+from whisperflow.tray import resolve_tray_icon, start_tray_indicator
 from whisperflow.web_dashboard import LiveDashboard, start_dashboard_server
 
 RUN_DIR = Path("run")
@@ -99,6 +101,8 @@ def show_status() -> None:
     _print_state_line(state, "output_dir", "Output dir")
     _print_state_line(state, "raw_transcript_path", "Raw transcript")
     _print_state_line(state, "final_transcript_path", "Final transcript")
+    _print_state_line(state, "output_raw_transcript_path", "Output raw transcript")
+    _print_state_line(state, "output_final_transcript_path", "Output transcript")
     _print_state_line(state, "backend", "Capture backend")
     _print_state_line(state, "device", "Capture device")
     _print_state_line(state, "sample_rate", "Sample rate")
@@ -109,6 +113,7 @@ def show_status() -> None:
     _print_state_line(state, "output_format", "Output format")
     _print_state_line(state, "web_url", "Web dashboard")
     _print_state_line(state, "web_error", "Web error")
+    _print_state_line(state, "output_error", "Output error")
     _print_state_line(state, "started_at", "Started")
     _print_state_line(state, "stopped_at", "Stopped")
     _print_state_line(state, "last_error", "Last error")
@@ -151,6 +156,21 @@ def _run_daemon(config_path: Path) -> None:
             update_state(web_error=str(exc))
             dashboard = None
 
+    include_output = (
+        config.get("live_capture", {}).get("audio", {}).get("include_output", False)
+    )
+    tray_thread: threading.Thread | None = None
+    tray_config = config.get("tray", {})
+    notify_icon: str | None = None
+    if isinstance(tray_config, dict) and tray_config.get("enabled", False):
+        tooltip = tray_config.get("tooltip", "Whisperflow: Recording")
+        icon_name = tray_config.get("icon", "media-record")
+        notify_icon, _ = resolve_tray_icon(icon_name)
+        tray_thread = start_tray_indicator(
+            stop_event, tooltip=tooltip, icon_name=icon_name
+        )
+        send_notification("Whisperflow", "Recording started.", icon=notify_icon)
+
     def capture_worker() -> None:
         try:
             update_state(status="running")
@@ -160,8 +180,22 @@ def _run_daemon(config_path: Path) -> None:
             update_state(status="error", last_error=str(exc))
             stop_event.set()
 
+    def output_worker() -> None:
+        try:
+            run_output_capture(config, {}, stop_event, dashboard)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Output capture worker crashed: %s", exc)
+            update_state(output_error=str(exc))
+
     capture_thread = threading.Thread(target=capture_worker, name="whisperflow-capture")
     capture_thread.start()
+
+    output_thread: threading.Thread | None = None
+    if include_output:
+        output_thread = threading.Thread(
+            target=output_worker, name="whisperflow-output-capture"
+        )
+        output_thread.start()
 
     def handle_request(message: dict[str, Any]) -> dict[str, Any]:
         command = message.get("command")
@@ -178,10 +212,18 @@ def _run_daemon(config_path: Path) -> None:
     serve(SOCKET_PATH, stop_event, handle_request)
 
     capture_thread.join()
+    if output_thread:
+        output_thread.join()
     if web_server:
         web_server.server_close()
+    if tray_thread:
+        tray_thread.join(timeout=1)
     _finalize_transcript(state, config, update_state)
+    if include_output:
+        _finalize_output_transcript(state, update_state)
     update_state(status="stopped", stopped_at=_now_iso())
+    if notify_icon:
+        send_notification("Whisperflow", "Recording stopped.", icon=notify_icon)
     logger.info("Daemon stopped.")
     _cleanup_socket()
     _remove_pid()
@@ -193,6 +235,8 @@ def _build_state(config: dict[str, Any]) -> dict[str, Any]:
     output_dir = Path(config["output_dir"])
     raw_path = output_dir / live["raw_transcript_filename"]
     final_path = output_dir / live["final_transcript_filename"]
+    output_raw_path = output_dir / live["output_raw_transcript_filename"]
+    output_final_path = output_dir / live["output_final_transcript_filename"]
     return {
         "status": "starting",
         "pid": os.getpid(),
@@ -201,6 +245,9 @@ def _build_state(config: dict[str, Any]) -> dict[str, Any]:
         "output_dir": str(output_dir),
         "raw_transcript_path": str(raw_path),
         "final_transcript_path": str(final_path),
+        "output_raw_transcript_path": str(output_raw_path),
+        "output_final_transcript_path": str(output_final_path),
+        "include_output": audio.get("include_output", False),
         "backend": live["backend"],
         "device": audio["device"],
         "sample_rate": audio["sample_rate"],
@@ -211,6 +258,7 @@ def _build_state(config: dict[str, Any]) -> dict[str, Any]:
         "output_format": config["output_format"],
         "web_url": None,
         "web_error": None,
+        "output_error": None,
         "last_error": None,
     }
 
@@ -230,6 +278,24 @@ def _finalize_transcript(
         _copy_final_transcript(content, config)
     except OSError as exc:
         update_state(status="error", last_error=f"Failed to finalize transcript: {exc}")
+
+
+def _finalize_output_transcript(state: dict[str, Any], update_state: Any) -> None:
+    raw_path_value = state.get("output_raw_transcript_path")
+    final_path_value = state.get("output_final_transcript_path")
+    if not raw_path_value or not final_path_value:
+        return
+    raw_path = Path(raw_path_value)
+    final_path = Path(final_path_value)
+    try:
+        if raw_path.exists():
+            content = raw_path.read_text(encoding="utf-8")
+        else:
+            content = ""
+        write_transcript(content, str(final_path))
+        update_state(output_finalized_at=_now_iso())
+    except OSError as exc:
+        update_state(output_error=f"Failed to finalize output transcript: {exc}")
 
 
 def _copy_final_transcript(text: str, config: dict[str, Any]) -> None:

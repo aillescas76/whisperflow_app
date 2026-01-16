@@ -118,6 +118,19 @@ def test_collect_overrides_populates_fields() -> None:
     }
 
 
+def test_collect_overrides_include_output() -> None:
+    args = argparse.Namespace(
+        model=None,
+        language=None,
+        task=None,
+        output_format=None,
+        output_dir=None,
+        include_output=True,
+    )
+    overrides = cli._collect_overrides(args)
+    assert overrides == {"live_capture": {"audio": {"include_output": True}}}
+
+
 def test_main_handles_unexpected_exception(monkeypatch) -> None:
     monkeypatch.setattr(cli, "load_config", lambda _path: DEFAULT_CONFIG)
     monkeypatch.setattr(cli, "setup_logging", lambda _config: None)

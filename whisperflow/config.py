@@ -32,12 +32,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "sample_rate": 16000,
             "channels": 1,
             "chunk_ms": 1000,
+            "include_output": False,
         },
+        "output_raw_transcript_filename": "live_output_raw.txt",
+        "output_final_transcript_filename": "transcript_output.txt",
         "vad": {
             "enabled": True,
-            "silence_ms": 500,
-            "min_speech_ms": 250,
+            "silence_ms": 700,
+            "min_speech_ms": 300,
             "energy_threshold": 0.01,
+            "max_buffer_ms": 30000,
+        },
+        "output_vad": {
+            "enabled": True,
+            "silence_ms": 700,
+            "min_speech_ms": 300,
+            "energy_threshold": 0.005,
             "max_buffer_ms": 30000,
         },
     },
@@ -54,6 +64,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "host": "127.0.0.1",
         "port": 8787,
+    },
+    "tray": {
+        "enabled": False,
+        "icon": "media-record",
+        "tooltip": "Whisperflow: Recording",
     },
     "logging": {
         "level": "INFO",
@@ -117,6 +132,8 @@ def _validate_config(config: dict[str, Any]) -> None:
     _validate_bool(live_capture, "enabled")
     _validate_str(live_capture, "raw_transcript_filename")
     _validate_str(live_capture, "final_transcript_filename")
+    _validate_str(live_capture, "output_raw_transcript_filename")
+    _validate_str(live_capture, "output_final_transcript_filename")
     _validate_str(live_capture, "backend", allowed=ALLOWED_BACKENDS)
 
     audio = _require_dict(live_capture, "audio")
@@ -124,13 +141,21 @@ def _validate_config(config: dict[str, Any]) -> None:
     _validate_int(audio, "sample_rate", min_value=1)
     _validate_int(audio, "channels", min_value=1)
     _validate_int(audio, "chunk_ms", min_value=1)
+    _validate_bool(audio, "include_output")
 
     vad = _require_dict(live_capture, "vad")
     _validate_bool(vad, "enabled")
     _validate_int(vad, "silence_ms", min_value=1)
     _validate_int(vad, "min_speech_ms", min_value=1)
-    _validate_float(vad, "energy_threshold", min_value=0.0)
+    _validate_float(vad, "energy_threshold", min_value=0)
     _validate_int(vad, "max_buffer_ms", min_value=1)
+
+    output_vad = _require_dict(live_capture, "output_vad")
+    _validate_bool(output_vad, "enabled")
+    _validate_int(output_vad, "silence_ms", min_value=1)
+    _validate_int(output_vad, "min_speech_ms", min_value=1)
+    _validate_float(output_vad, "energy_threshold", min_value=0)
+    _validate_int(output_vad, "max_buffer_ms", min_value=1)
 
     postprocess = _require_dict(config, "postprocess")
     _validate_bool(postprocess, "enabled")
@@ -145,6 +170,11 @@ def _validate_config(config: dict[str, Any]) -> None:
     _validate_bool(web_config, "enabled")
     _validate_str(web_config, "host")
     _validate_port(web_config, "port")
+
+    tray_config = _require_dict(config, "tray")
+    _validate_bool(tray_config, "enabled")
+    _validate_str(tray_config, "icon")
+    _validate_str(tray_config, "tooltip")
 
     logging_config = _require_dict(config, "logging")
     _validate_str(logging_config, "level", allowed=ALLOWED_LOG_LEVELS)

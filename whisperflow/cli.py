@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from whisperflow.config import apply_overrides, load_config
-from whisperflow.errors import ConfigError, WhisperflowRuntimeError, UserInputError, format_error
+from whisperflow.errors import (
+    ConfigError,
+    WhisperflowRuntimeError,
+    UserInputError,
+    format_error,
+)
 from whisperflow.logging_utils import setup_logging
 
 DEFAULT_CONFIG_PATH = Path("config") / "config.json"
@@ -75,10 +80,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser(
+    start_parser = subparsers.add_parser(
         "start",
         help="Start live capture via daemon.",
         parents=[common_parser],
+    )
+    start_parser.add_argument(
+        "--include-output",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Also capture system output audio.",
     )
 
     subparsers.add_parser(
@@ -111,11 +122,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _add_common_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--model", default=None, help="Model size: small, medium, large-v3.")
+    parser.add_argument(
+        "--model", default=None, help="Model size: small, medium, large-v3."
+    )
     parser.add_argument("--language", default=None, help="Language code or 'auto'.")
     parser.add_argument("--task", default=None, help="Task: transcribe or translate.")
-    parser.add_argument("--output_format", default=None, help="Output format: txt, srt, vtt, json.")
-    parser.add_argument("--output_dir", default=None, help="Directory for output files.")
+    parser.add_argument(
+        "--output_format", default=None, help="Output format: txt, srt, vtt, json."
+    )
+    parser.add_argument(
+        "--output_dir", default=None, help="Directory for output files."
+    )
 
 
 def _collect_overrides(args: argparse.Namespace) -> dict[str, Any]:
@@ -130,6 +147,13 @@ def _collect_overrides(args: argparse.Namespace) -> dict[str, Any]:
         overrides["output_format"] = args.output_format
     if args.output_dir is not None:
         overrides["output_dir"] = args.output_dir
+    include_output = getattr(args, "include_output", None)
+    if include_output is not None:
+        overrides["live_capture"] = {
+            "audio": {
+                "include_output": include_output,
+            }
+        }
     return overrides
 
 
@@ -187,23 +211,33 @@ def _handle_status() -> None:
     try:
         from whisperflow.daemon import show_status
     except ModuleNotFoundError as exc:
-        raise WhisperflowRuntimeError("Live capture status is not available yet.") from exc
+        raise WhisperflowRuntimeError(
+            "Live capture status is not available yet."
+        ) from exc
     show_status()
 
 
-def _handle_transcribe(input_path: str, config: dict[str, Any], overrides: dict[str, Any]) -> None:
+def _handle_transcribe(
+    input_path: str, config: dict[str, Any], overrides: dict[str, Any]
+) -> None:
     try:
         from whisperflow.transcribe import run_transcribe
     except ModuleNotFoundError as exc:
-        raise WhisperflowRuntimeError("File transcription is not available yet.") from exc
+        raise WhisperflowRuntimeError(
+            "File transcription is not available yet."
+        ) from exc
     run_transcribe(input_path, config, overrides)
 
 
-def _handle_batch(input_dir: str, config: dict[str, Any], overrides: dict[str, Any]) -> None:
+def _handle_batch(
+    input_dir: str, config: dict[str, Any], overrides: dict[str, Any]
+) -> None:
     try:
         from whisperflow.batch import run_batch
     except ModuleNotFoundError as exc:
-        raise WhisperflowRuntimeError("Batch transcription is not available yet.") from exc
+        raise WhisperflowRuntimeError(
+            "Batch transcription is not available yet."
+        ) from exc
     run_batch(input_dir, config, overrides)
 
 

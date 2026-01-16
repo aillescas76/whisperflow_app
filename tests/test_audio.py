@@ -184,6 +184,42 @@ def test_open_audio_capture_invalid_backend(monkeypatch) -> None:
         audio.open_audio_capture("invalid", "default", 16000, 1, 100)
 
 
+def test_open_output_capture_invalid_backend(monkeypatch) -> None:
+    monkeypatch.setattr(audio, "_resolve_backend", lambda *_: "invalid")
+    with pytest.raises(WhisperflowRuntimeError, match="Unsupported audio backend"):
+        audio.open_output_capture("invalid", "default", 16000, 1, 100)
+
+
+def test_open_output_capture_missing_output_device(monkeypatch) -> None:
+    monkeypatch.setattr(audio, "_resolve_backend", lambda *_: "sounddevice")
+    monkeypatch.setattr(audio, "_resolve_system_default_output_device", lambda: None)
+    monkeypatch.setattr(audio, "_pactl_default_sink", lambda: "default_sink")
+    monkeypatch.setattr(audio.shutil, "which", lambda _name: None)
+
+    with pytest.raises(
+        WhisperflowRuntimeError, match="Unable to resolve system output device"
+    ):
+        audio.open_output_capture("sounddevice", "default", 16000, 1, 100)
+
+
+def test_open_output_capture_arecord_unsupported(monkeypatch) -> None:
+    monkeypatch.setattr(audio, "_resolve_backend", lambda *_: "arecord")
+    with pytest.raises(
+        WhisperflowRuntimeError, match="arecord backend does not support output capture"
+    ):
+        audio.open_output_capture("arecord", "default", 16000, 1, 100)
+
+
+def test_open_output_capture_pw_record_without_sink(monkeypatch) -> None:
+    monkeypatch.setattr(audio, "_resolve_backend", lambda *_: "pw-record")
+    monkeypatch.setattr(audio, "_pactl_default_sink", lambda: None)
+    with pytest.raises(
+        WhisperflowRuntimeError,
+        match="Unable to resolve PipeWire default sink",
+    ):
+        audio.open_output_capture("pw-record", "default", 16000, 1, 100)
+
+
 def test_resolve_backend_requested_backend_missing(monkeypatch) -> None:
     monkeypatch.setattr(audio, "_sounddevice_available", lambda: False)
     monkeypatch.setattr(audio.shutil, "which", lambda _name: None)
@@ -299,6 +335,40 @@ def test_resolve_system_default_device_without_pactl(monkeypatch) -> None:
     assert audio._resolve_system_default_device() is None
 
 
+def test_resolve_system_default_output_device(monkeypatch) -> None:
+    def fake_run(args, capture_output, text, check):  # noqa: ANN001
+        if args[:2] == ["pactl", "info"]:
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="Default Sink: bluez_output.test\n",
+            )
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "Source #1\n"
+                "\tName: bluez_output.test.monitor\n"
+                "\tDescription: HD 450SE Monitor\n"
+                "\tProperties:\n"
+                '\t\tdevice.description = "HD 450SE"\n'
+            ),
+        )
+
+    fake_sd = types.SimpleNamespace(
+        query_devices=lambda: [
+            {"name": "HD 450SE Monitor", "max_input_channels": 1},
+            {"name": "Other", "max_input_channels": 1},
+        ]
+    )
+
+    monkeypatch.setitem(__import__("sys").modules, "sounddevice", fake_sd)
+    monkeypatch.setattr(audio.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        audio, "_pactl_default_monitor_source", lambda: "bluez_output.test.monitor"
+    )
+
+    assert audio._resolve_system_default_output_device() == 0
+
+
 def test_open_audio_capture_bluetooth_fallback(monkeypatch) -> None:
     sentinel = object()
 
@@ -312,4 +382,20 @@ def test_open_audio_capture_bluetooth_fallback(monkeypatch) -> None:
     monkeypatch.setattr(audio, "_SubprocessCapture", lambda *_args, **_kwargs: sentinel)
 
     result = audio.open_audio_capture("sounddevice", "default", 16000, 1, 100)
+    assert result is sentinel
+
+
+def test_open_output_capture_bluetooth_fallback(monkeypatch) -> None:
+    sentinel = object()
+
+    monkeypatch.setattr(audio, "_resolve_backend", lambda *_: "sounddevice")
+    monkeypatch.setattr(audio, "_resolve_system_default_output_device", lambda: None)
+    monkeypatch.setattr(audio, "_pactl_default_sink", lambda: "bluez_output.test")
+    monkeypatch.setattr(
+        audio, "_build_pw_record_command", lambda *_args, **_kwargs: ["pw-record"]
+    )
+    monkeypatch.setattr(audio.shutil, "which", lambda _name: "/usr/bin/pw-record")
+    monkeypatch.setattr(audio, "_SubprocessCapture", lambda *_args, **_kwargs: sentinel)
+
+    result = audio.open_output_capture("sounddevice", "default", 16000, 1, 100)
     assert result is sentinel

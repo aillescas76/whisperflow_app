@@ -41,6 +41,21 @@ def test_web_port_must_be_valid() -> None:
         _override(DEFAULT_CONFIG, {"web": {"port": 70000}})
 
 
+def test_audio_include_output_must_be_bool() -> None:
+    with pytest.raises(ConfigError, match="include_output"):
+        _override(
+            DEFAULT_CONFIG, {"live_capture": {"audio": {"include_output": "yes"}}}
+        )
+
+
+def test_output_vad_energy_must_be_float() -> None:
+    with pytest.raises(ConfigError, match="energy_threshold"):
+        _override(
+            DEFAULT_CONFIG,
+            {"live_capture": {"output_vad": {"energy_threshold": "high"}}},
+        )
+
+
 def test_load_config_applies_audio_and_vad_defaults(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")

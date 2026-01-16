@@ -13,7 +13,24 @@
       "device": "default",
       "sample_rate": 16000,
       "channels": 1,
-      "chunk_ms": 1000
+      "chunk_ms": 250,
+      "include_output": false
+    },
+    "output_raw_transcript_filename": "live_output_raw.txt",
+    "output_final_transcript_filename": "transcript_output.txt",
+    "vad": {
+      "enabled": true,
+      "silence_ms": 350,
+      "min_speech_ms": 200,
+      "energy_threshold": 0.01,
+      "max_buffer_ms": 3000
+    },
+    "output_vad": {
+      "enabled": true,
+      "silence_ms": 350,
+      "min_speech_ms": 200,
+      "energy_threshold": 0.005,
+      "max_buffer_ms": 3000
     }
   },
   "postprocess": {
@@ -29,6 +46,11 @@
     "enabled": true,
     "host": "127.0.0.1",
     "port": 8787
+  },
+  "tray": {
+    "enabled": true,
+    "icon": "custom",
+    "tooltip": "Whisperflow: Recording"
   },
   "logging": {
     "level": "INFO",

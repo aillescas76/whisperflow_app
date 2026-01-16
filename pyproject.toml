@@ -12,3 +12,4 @@ include = ["whisperflow*"]
 
 [project.optional-dependencies]
 dev = ["pytest", "coverage"]
+tray = ["pystray", "pillow", "pygobject"]

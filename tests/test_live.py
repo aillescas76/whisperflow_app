@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from whisperflow.live import (
+    _backup_existing_dir,
     _backup_existing_file,
     _preview_transcript,
     _read_transcript,
@@ -31,6 +32,26 @@ def test_backup_existing_file_creates_timestamped_copy(tmp_path, monkeypatch) ->
     assert backup.exists()
     assert not source.exists()
     assert backup.read_text(encoding="utf-8") == "hello"
+
+
+def test_backup_existing_dir_creates_timestamped_copy(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "live_segments"
+    source.mkdir()
+    (source / "segment.wav").write_bytes(b"data")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001
+            return datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    monkeypatch.setattr("whisperflow.live.datetime", FixedDateTime)
+
+    _backup_existing_dir(source)
+
+    backup = tmp_path / "live_segments.20240102T030405Z.bak"
+    assert backup.exists()
+    assert not source.exists()
+    assert (backup / "segment.wav").exists()
 
 
 def test_dashboard_tracks_segment_success() -> None:

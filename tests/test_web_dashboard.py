@@ -79,3 +79,41 @@ def test_dashboard_listener_lifecycle() -> None:
     dashboard.unregister_listener(listener)
 
     assert payload["last_error"] == "boom"
+
+
+def test_dashboard_output_segment_snapshot() -> None:
+    dashboard = LiveDashboard(
+        {
+            "model": "small",
+            "language": "en",
+            "task": "transcribe",
+            "output_format": "txt",
+        }
+    )
+    dashboard.output_segment_started(1, 1200.0)
+    dashboard.output_segment_finished(1, 1200.0, 600.0, True, "output")
+    snapshot = dashboard.snapshot()
+
+    assert snapshot["output_segments_total"] == 1
+    assert snapshot["output_segments_failed"] == 0
+    assert snapshot["output_realtime_factor"] == 0.5
+
+    last = snapshot["output_recent_segments"][0]
+    assert last["preview"] == "output"
+
+
+def test_dashboard_transcript_accumulates() -> None:
+    dashboard = LiveDashboard(
+        {
+            "model": "small",
+            "language": "en",
+            "task": "transcribe",
+            "output_format": "txt",
+        }
+    )
+    dashboard.append_transcript("hello world")
+    dashboard.append_transcript("from output", output_mode=True)
+    snapshot = dashboard.snapshot()
+
+    assert snapshot["live_transcript"] == "hello world"
+    assert snapshot["output_transcript"] == "from output"

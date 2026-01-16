@@ -34,14 +34,23 @@ class LiveDashboard:
         self._lock = threading.Lock()
         self._queues: list[queue.Queue[dict[str, Any]]] = []
         self._segments: Deque[SegmentMetrics] = deque(maxlen=history_limit)
+        self._output_segments: Deque[SegmentMetrics] = deque(maxlen=history_limit)
         self._status = "starting"
         self._started_at = _now_iso()
         self._current_segment: dict[str, Any] | None = None
+        self._output_current_segment: dict[str, Any] | None = None
         self._total_audio_ms = 0.0
         self._total_transcribe_ms = 0.0
+        self._output_total_audio_ms = 0.0
+        self._output_total_transcribe_ms = 0.0
         self._segments_total = 0
         self._segments_failed = 0
+        self._output_segments_total = 0
+        self._output_segments_failed = 0
         self._last_error: str | None = None
+        self._output_last_error: str | None = None
+        self._live_transcript: list[str] = []
+        self._output_transcript: list[str] = []
         self._model = config.get("model", "unknown")
         self._language = config.get("language", "auto")
         self._task = config.get("task", "transcribe")
@@ -57,11 +66,26 @@ class LiveDashboard:
             self._last_error = message
         self.publish_snapshot()
 
+    def output_mark_error(self, message: str) -> None:
+        with self._lock:
+            self._output_last_error = message
+        self.publish_snapshot()
+
     def segment_started(self, index: int, audio_ms: float) -> None:
         started_at = _now_iso()
         with self._lock:
             self._status = "transcribing"
             self._current_segment = {
+                "index": index,
+                "audio_ms": round(audio_ms, 2),
+                "started_at": started_at,
+            }
+        self.publish_snapshot()
+
+    def output_segment_started(self, index: int, audio_ms: float) -> None:
+        started_at = _now_iso()
+        with self._lock:
+            self._output_current_segment = {
                 "index": index,
                 "audio_ms": round(audio_ms, 2),
                 "started_at": started_at,
@@ -105,6 +129,52 @@ class LiveDashboard:
 
         self.publish_snapshot()
 
+    def output_segment_finished(
+        self,
+        index: int,
+        audio_ms: float,
+        transcribe_ms: float,
+        success: bool,
+        transcript_preview: str,
+    ) -> None:
+        finished_at = _now_iso()
+        transcript_chars = len(transcript_preview)
+        realtime_factor = _safe_divide(transcribe_ms, audio_ms)
+        metrics = SegmentMetrics(
+            index=index,
+            audio_ms=round(audio_ms, 2),
+            transcribe_ms=round(transcribe_ms, 2),
+            realtime_factor=round(realtime_factor, 3),
+            success=success,
+            transcript_chars=transcript_chars,
+            started_at=self._output_current_segment.get("started_at", finished_at)
+            if self._output_current_segment
+            else finished_at,
+            finished_at=finished_at,
+            preview=transcript_preview,
+        )
+
+        with self._lock:
+            self._output_segments_total += 1
+            self._output_total_audio_ms += audio_ms
+            self._output_total_transcribe_ms += transcribe_ms
+            if not success:
+                self._output_segments_failed += 1
+            self._output_segments.appendleft(metrics)
+            self._output_current_segment = None
+
+        self.publish_snapshot()
+
+    def append_transcript(self, text: str, *, output_mode: bool = False) -> None:
+        cleaned = " ".join(text.strip().split())
+        if not cleaned:
+            return
+        with self._lock:
+            if output_mode:
+                self._output_transcript.append(cleaned)
+            else:
+                self._live_transcript.append(cleaned)
+
     def register_listener(self) -> queue.Queue[dict[str, Any]]:
         listener: queue.Queue[dict[str, Any]] = queue.Queue()
         with self._lock:
@@ -129,6 +199,17 @@ class LiveDashboard:
                 self._total_transcribe_ms, self._segments_total
             )
             realtime_factor = _safe_divide(total_transcribe_s, total_audio_s)
+            output_total_audio_s = self._output_total_audio_ms / 1000.0
+            output_total_transcribe_s = self._output_total_transcribe_ms / 1000.0
+            output_average_audio_ms = _safe_divide(
+                self._output_total_audio_ms, self._output_segments_total
+            )
+            output_average_transcribe_ms = _safe_divide(
+                self._output_total_transcribe_ms, self._output_segments_total
+            )
+            output_realtime_factor = _safe_divide(
+                output_total_transcribe_s, output_total_audio_s
+            )
             return {
                 "status": self._status,
                 "started_at": self._started_at,
@@ -148,6 +229,20 @@ class LiveDashboard:
                 "recent_segments": [
                     segment.__dict__ for segment in list(self._segments)
                 ],
+                "live_transcript": " ".join(self._live_transcript).strip(),
+                "output_segments_total": self._output_segments_total,
+                "output_segments_failed": self._output_segments_failed,
+                "output_total_audio_seconds": round(output_total_audio_s, 2),
+                "output_total_transcribe_seconds": round(output_total_transcribe_s, 2),
+                "output_average_audio_ms": round(output_average_audio_ms, 2),
+                "output_average_transcribe_ms": round(output_average_transcribe_ms, 2),
+                "output_realtime_factor": round(output_realtime_factor, 3),
+                "output_current_segment": self._output_current_segment,
+                "output_last_error": self._output_last_error,
+                "output_recent_segments": [
+                    segment.__dict__ for segment in list(self._output_segments)
+                ],
+                "output_transcript": " ".join(self._output_transcript).strip(),
             }
 
     def _broadcast(self, payload: dict[str, Any]) -> None:
@@ -387,6 +482,11 @@ DASHBOARD_HTML = """<!doctype html>
     </section>
 
     <section class="panel">
+      <h2 class="section-title">Output Transcript</h2>
+      <div class="transcript" id="output_transcript">Waiting for transcript...</div>
+    </section>
+
+    <section class="panel">
       <h2 class="section-title">Current Segment</h2>
       <div class="row">
         <div class="card">
@@ -430,6 +530,34 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
       <div style="margin-top: 12px;" class="muted">Preview</div>
       <div style="margin-top: 6px;" class="transcript" id="last_preview">-</div>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Output Segment</h2>
+      <div class="row">
+        <div class="card">
+          <div class="label">Index</div>
+          <div class="value" id="output_last_index">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Audio (ms)</div>
+          <div class="value" id="output_last_audio">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Transcribe (ms)</div>
+          <div class="value" id="output_last_transcribe">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Realtime Factor</div>
+          <div class="value" id="output_last_rtf">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Status</div>
+          <div class="value" id="output_last_status">-</div>
+        </div>
+      </div>
+      <div style="margin-top: 12px;" class="muted">Preview</div>
+      <div style="margin-top: 6px;" class="transcript" id="output_last_preview">-</div>
     </section>
 
     <section class="panel">
@@ -491,12 +619,22 @@ DASHBOARD_HTML = """<!doctype html>
       setText("current_started", current.started_at);
 
       const last = (data.recent_segments || [])[0] || {};
+      const lastStatus = last.success === undefined ? "-" : (last.success ? "ok" : "failed");
       setText("last_index", last.index);
       setText("last_audio", last.audio_ms);
       setText("last_transcribe", last.transcribe_ms);
       setText("last_rtf", last.realtime_factor);
-      setText("last_status", last.success ? "ok" : "failed");
+      setText("last_status", lastStatus);
       setText("last_preview", last.preview || "-");
+
+      const outputLast = (data.output_recent_segments || [])[0] || {};
+      const outputStatus = outputLast.success === undefined ? "-" : (outputLast.success ? "ok" : "failed");
+      setText("output_last_index", outputLast.index);
+      setText("output_last_audio", outputLast.audio_ms);
+      setText("output_last_transcribe", outputLast.transcribe_ms);
+      setText("output_last_rtf", outputLast.realtime_factor);
+      setText("output_last_status", outputStatus);
+      setText("output_last_preview", outputLast.preview || "-");
 
       const list = document.getElementById("recent_segments");
       if (list) {
@@ -510,13 +648,12 @@ DASHBOARD_HTML = """<!doctype html>
 
       const live = document.getElementById("live_transcript");
       if (live) {
-        const transcript = (data.recent_segments || [])
-          .slice()
-          .reverse()
-          .map((segment) => segment.preview)
-          .filter(Boolean)
-          .join(" ");
-        live.textContent = transcript || "Waiting for transcript...";
+        live.textContent = data.live_transcript || "Waiting for transcript...";
+      }
+
+      const outputLive = document.getElementById("output_transcript");
+      if (outputLive) {
+        outputLive.textContent = data.output_transcript || "Waiting for transcript...";
       }
     };
   </script>

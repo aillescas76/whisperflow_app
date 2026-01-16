@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -48,6 +49,16 @@ def open_audio_capture(
 ) -> AudioCapture:
     """Create an audio capture backend based on configuration."""
     resolved = _resolve_backend(backend)
+    if resolved == "pw-record":
+        target = None
+        if device == "default":
+            target = _resolve_pw_target_source()
+        else:
+            target = str(device)
+        if target:
+            logger.info("pw-record input target: %s", target)
+        command = _build_pw_record_command(sample_rate, channels, target=target)
+        return _SubprocessCapture(command, sample_rate, channels, chunk_ms)
     if resolved == "sounddevice":
         resolved_device = device
         default_source = None
@@ -86,6 +97,75 @@ def open_audio_capture(
     raise WhisperflowRuntimeError(f"Unsupported audio backend: {resolved}")
 
 
+def open_output_capture(
+    backend: str,
+    device: str | int,
+    sample_rate: int,
+    channels: int,
+    chunk_ms: int,
+) -> AudioCapture:
+    """Create an audio capture backend for system output monitoring."""
+    resolved = _resolve_backend(backend)
+    if resolved == "pw-record":
+        target = None
+        if device == "default":
+            target = _resolve_pw_target_sink()
+        else:
+            target = str(device)
+        if target:
+            logger.info("pw-record output target: %s", target)
+        command = _build_pw_record_command(sample_rate, channels, target=target)
+        return _SubprocessCapture(command, sample_rate, channels, chunk_ms)
+    if resolved == "sounddevice":
+        resolved_device = device
+        if device == "default":
+            system_device = _resolve_system_default_output_device()
+            if system_device is not None:
+                resolved_device = system_device
+                logger.info("Resolved system output device to %s.", system_device)
+                return _SoundDeviceCapture(
+                    resolved_device, sample_rate, channels, chunk_ms
+                )
+
+            sink_target = _pactl_default_sink()
+            if sink_target and shutil.which("pw-record") is not None:
+                logger.info(
+                    "Using pw-record for output sink '%s'.",
+                    sink_target,
+                )
+                command = _build_pw_record_command(
+                    sample_rate, channels, target=sink_target
+                )
+                return _SubprocessCapture(command, sample_rate, channels, chunk_ms)
+            if sink_target:
+                logger.warning(
+                    "Output sink '%s' detected but pw-record is unavailable.",
+                    sink_target,
+                )
+            raise WhisperflowRuntimeError(
+                "Unable to resolve system output device for capture. "
+                "Ensure PipeWire default sink is available and pw-record is installed."
+            )
+        return _SoundDeviceCapture(resolved_device, sample_rate, channels, chunk_ms)
+    if resolved == "arecord":
+        raise WhisperflowRuntimeError(
+            "arecord backend does not support output capture."
+        )
+    if resolved == "pw-record":
+        target = None
+        if device == "default":
+            target = _pactl_default_sink()
+            if not target:
+                raise WhisperflowRuntimeError(
+                    "Unable to resolve PipeWire default sink for output capture."
+                )
+        elif isinstance(device, str):
+            target = device
+        command = _build_pw_record_command(sample_rate, channels, target=target)
+        return _SubprocessCapture(command, sample_rate, channels, chunk_ms)
+    raise WhisperflowRuntimeError(f"Unsupported audio backend: {resolved}")
+
+
 def _resolve_backend(backend: str) -> str:
     if backend != "auto":
         if backend == "sounddevice" and not _sounddevice_available():
@@ -98,12 +178,12 @@ def _resolve_backend(backend: str) -> str:
             )
         return backend
 
+    if shutil.which("pw-record") is not None:
+        return "pw-record"
     if _sounddevice_available():
         return "sounddevice"
     if shutil.which("arecord") is not None:
         return "arecord"
-    if shutil.which("pw-record") is not None:
-        return "pw-record"
     raise WhisperflowRuntimeError(
         "No supported audio capture backend is available (sounddevice, arecord, pw-record)."
     )
@@ -120,14 +200,29 @@ def _sounddevice_available() -> bool:
 def _should_use_pipewire(default_source: str | None) -> bool:
     if not default_source:
         return False
-    return default_source.startswith("bluez_input")
+    return default_source.startswith("bluez_input") or default_source.startswith(
+        "bluez_output"
+    )
 
 
 def _resolve_system_default_device() -> str | int | None:
     default_source = _pactl_default_source()
     if not default_source:
         return None
-    metadata = _pactl_source_metadata(default_source)
+    return _resolve_system_device_from_source(default_source, label="input")
+
+
+def _resolve_system_default_output_device() -> str | int | None:
+    monitor_source = _pactl_default_monitor_source()
+    if not monitor_source:
+        return None
+    return _resolve_system_device_from_source(monitor_source, label="output")
+
+
+def _resolve_system_device_from_source(
+    source_name: str, *, label: str
+) -> str | int | None:
+    metadata = _pactl_source_metadata(source_name)
     try:
         import sounddevice as sd
     except ImportError:
@@ -143,9 +238,11 @@ def _resolve_system_default_device() -> str | int | None:
     best_index: int | None = None
     best_name = ""
     best_score = 0
-    is_bluez = default_source.startswith("bluez_input")
+    is_bluez = source_name.startswith("bluez_input") or source_name.startswith(
+        "bluez_output"
+    )
 
-    logger.info("System default source: %s", default_source)
+    logger.info("System default %s source: %s", label, source_name)
     for index, device in enumerate(devices):
         if not isinstance(device, dict):
             continue
@@ -155,7 +252,7 @@ def _resolve_system_default_device() -> str | int | None:
         name = str(device.get("name", ""))
         normalized_name = _normalize_token(name)
         score = _score_device_match(
-            default_source,
+            source_name,
             description,
             device_description,
             product_name,
@@ -195,7 +292,7 @@ def _resolve_system_default_device() -> str | int | None:
                 best_score = 1
                 logger.info(
                     "Fallback bluetooth match for '%s' resolved to %s (%s).",
-                    default_source,
+                    source_name,
                     best_index,
                     best_name,
                 )
@@ -204,14 +301,14 @@ def _resolve_system_default_device() -> str | int | None:
     if best_score == 0:
         logger.warning(
             "Unable to map system default source '%s' to a sounddevice input.",
-            default_source,
+            source_name,
         )
         _log_sounddevice_inputs(devices)
         return None
 
     logger.info(
         "Mapped default source '%s' to sounddevice input %s (%s).",
-        default_source,
+        source_name,
         best_index,
         best_name,
     )
@@ -233,18 +330,125 @@ def _log_sounddevice_inputs(devices: list[Any]) -> None:
 
 
 def _pactl_default_source() -> str | None:
+    info = _pactl_info()
+    if not info:
+        return None
+    return info.get("default_source")
+
+
+def _pactl_default_sink() -> str | None:
+    info = _pactl_info()
+    if not info:
+        return None
+    return info.get("default_sink")
+
+
+def _pw_dump_nodes() -> list[dict[str, Any]]:
+    try:
+        result = subprocess.run(
+            ["pw-dump"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return []
+    if result.returncode != 0:
+        return []
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _pw_find_node_serial(
+    nodes: list[dict[str, Any]], name: str, media_class: str
+) -> int | None:
+    for item in nodes:
+        if item.get("type") != "PipeWire:Interface:Node":
+            continue
+        info = item.get("info")
+        if not isinstance(info, dict):
+            continue
+        props = info.get("props")
+        if not isinstance(props, dict):
+            continue
+        if props.get("media.class") != media_class:
+            continue
+        if props.get("node.name") == name:
+            serial = props.get("object.serial")
+            if isinstance(serial, int):
+                return serial
+    return None
+
+
+def _resolve_pw_target_source() -> str | None:
+    default_source = _pactl_default_source()
+    if not default_source:
+        return None
+    nodes = _pw_dump_nodes()
+    node_serial = _pw_find_node_serial(nodes, default_source, "Audio/Source")
+    if node_serial is not None:
+        return str(node_serial)
+    return default_source
+
+
+def _resolve_pw_target_sink() -> str | None:
+    default_sink = _pactl_default_sink()
+    if not default_sink:
+        return None
+    nodes = _pw_dump_nodes()
+    node_serial = _pw_find_node_serial(nodes, default_sink, "Audio/Sink")
+    if node_serial is not None:
+        return str(node_serial)
+    return default_sink
+
+
+def _pactl_default_monitor_source() -> str | None:
+    default_sink = _pactl_default_sink()
+    if not default_sink:
+        return None
+    monitor = f"{default_sink}.monitor"
+    if _pactl_has_source(monitor):
+        return monitor
+    return None
+
+
+def _pactl_info() -> dict[str, str]:
     try:
         result = subprocess.run(
             ["pactl", "info"], capture_output=True, text=True, check=False
         )
     except OSError:
-        return None
+        return {}
     if result.returncode != 0:
-        return None
+        return {}
+    info: dict[str, str] = {}
     for line in result.stdout.splitlines():
         if line.startswith("Default Source:"):
-            return line.split(":", 1)[1].strip()
-    return None
+            info["default_source"] = line.split(":", 1)[1].strip()
+        if line.startswith("Default Sink:"):
+            info["default_sink"] = line.split(":", 1)[1].strip()
+    return info
+
+
+def _pactl_has_source(source_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "sources", "short"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) > 1 and parts[1] == source_name:
+            return True
+    return False
 
 
 def _pactl_source_metadata(source_name: str) -> dict[str, str]:
@@ -536,4 +740,4 @@ class _SubprocessCapture:
         self._process = None
 
 
-__all__ = ["AudioCapture", "AudioChunk", "open_audio_capture"]
+__all__ = ["AudioCapture", "AudioChunk", "open_audio_capture", "open_output_capture"]
