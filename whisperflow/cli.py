@@ -52,6 +52,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "batch":
             _handle_batch(args.input_dir, config, overrides)
             return 0
+        if args.command == "mix":
+            merged_config = apply_overrides(config, overrides)
+            _handle_mix(merged_config)
+            return 0
     except (ConfigError, UserInputError, WhisperflowRuntimeError) as exc:
         print(format_error(exc), file=sys.stderr)
         return 1
@@ -117,6 +121,12 @@ def _build_parser() -> argparse.ArgumentParser:
         parents=[common_parser],
     )
     batch_parser.add_argument("input_dir", help="Folder containing audio files.")
+
+    subparsers.add_parser(
+        "mix",
+        help="Mix using existing re-transcription outputs without stopping the daemon.",
+        parents=[common_parser],
+    )
 
     return parser
 
@@ -239,6 +249,14 @@ def _handle_batch(
             "Batch transcription is not available yet."
         ) from exc
     run_batch(input_dir, config, overrides)
+
+
+def _handle_mix(config: dict[str, Any]) -> None:
+    try:
+        from whisperflow.mix import run_mixing_process
+    except ModuleNotFoundError as exc:
+        raise WhisperflowRuntimeError("Mixing is not available yet.") from exc
+    run_mixing_process(config)
 
 
 __all__ = ["main"]

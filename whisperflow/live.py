@@ -15,6 +15,7 @@ from typing import Any
 from whisperflow.audio import AudioChunk, open_audio_capture, open_output_capture
 from whisperflow.config import apply_overrides
 from whisperflow.errors import WhisperflowRuntimeError
+from whisperflow.model_utils import select_best_model
 from whisperflow.transcribe import run_transcribe
 from whisperflow.web_dashboard import LiveDashboard
 
@@ -360,7 +361,7 @@ def _flush_buffer(
     output_overrides = {
         "output_dir": str(segments_dir),
         "output_format": config["output_format"],
-        "model": config["model"],
+        "model": select_best_model(config["model"]),
         "language": config["language"],
         "task": config["task"],
     }

@@ -56,6 +56,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "provider": "llm",
         "profile": "default",
     },
+    "mixing": {
+        "enabled": True,
+        "ollama_model": "glm-4.7-flash:latest",
+        "unload_on_start": True,
+    },
     "clipboard": {
         "enabled": True,
         "tool": "auto",
@@ -69,6 +74,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
         "icon": "media-record",
         "tooltip": "Whisperflow: Recording",
+    },
+    "archive": {
+        "enabled": True,
+        "dir_name": "archives",
+        "web": {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "port": 8788,
+        },
     },
     "logging": {
         "level": "INFO",
@@ -162,6 +176,11 @@ def _validate_config(config: dict[str, Any]) -> None:
     _validate_str(postprocess, "provider")
     _validate_str(postprocess, "profile")
 
+    mixing = _require_dict(config, "mixing")
+    _validate_bool(mixing, "enabled")
+    _validate_str(mixing, "ollama_model")
+    _validate_bool(mixing, "unload_on_start")
+
     clipboard = _require_dict(config, "clipboard")
     _validate_bool(clipboard, "enabled")
     _validate_str(clipboard, "tool")
@@ -175,6 +194,14 @@ def _validate_config(config: dict[str, Any]) -> None:
     _validate_bool(tray_config, "enabled")
     _validate_str(tray_config, "icon")
     _validate_str(tray_config, "tooltip")
+
+    archive_config = _require_dict(config, "archive")
+    _validate_bool(archive_config, "enabled")
+    _validate_str(archive_config, "dir_name")
+    archive_web = _require_dict(archive_config, "web")
+    _validate_bool(archive_web, "enabled")
+    _validate_str(archive_web, "host")
+    _validate_port(archive_web, "port")
 
     logging_config = _require_dict(config, "logging")
     _validate_str(logging_config, "level", allowed=ALLOWED_LOG_LEVELS)

@@ -38,6 +38,11 @@
     "provider": "llm",
     "profile": "default"
   },
+  "mixing": {
+    "enabled": true,
+    "ollama_model": "glm-4.7-flash:latest",
+    "unload_on_start": true
+  },
   "clipboard": {
     "enabled": true,
     "tool": "auto"
@@ -51,6 +56,15 @@
     "enabled": true,
     "icon": "custom",
     "tooltip": "Whisperflow: Recording"
+  },
+  "archive": {
+    "enabled": true,
+    "dir_name": "archives",
+    "web": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8788
+    }
   },
   "logging": {
     "level": "INFO",

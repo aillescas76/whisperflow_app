@@ -21,6 +21,7 @@ from whisperflow.config import load_config
 from whisperflow.errors import WhisperflowRuntimeError
 from whisperflow.ipc import send_command, serve
 from whisperflow.live import run_live_capture, run_output_capture
+from whisperflow.mix import merge_lines_fallback, mix_with_ollama, unload_ollama_models
 from whisperflow.logging_utils import setup_logging
 from whisperflow.notify import send_notification
 from whisperflow.output import write_transcript
@@ -113,6 +114,10 @@ def show_status() -> None:
     _print_state_line(state, "output_format", "Output format")
     _print_state_line(state, "web_url", "Web dashboard")
     _print_state_line(state, "web_error", "Web error")
+    _print_state_line(state, "archive_dir", "Archive dir")
+    _print_state_line(state, "archive_web_url", "Archive browser")
+    _print_state_line(state, "archive_web_error", "Archive web error")
+    _print_state_line(state, "last_archive_dir", "Last archive")
     _print_state_line(state, "output_error", "Output error")
     _print_state_line(state, "started_at", "Started")
     _print_state_line(state, "stopped_at", "Stopped")
@@ -126,6 +131,7 @@ def _run_daemon(config_path: Path) -> None:
     config = load_config(str(config_path))
     setup_logging(config)
     logger.info("Daemon starting.")
+    _maybe_unload_ollama_models(config)
     _ensure_run_dir()
     _cleanup_socket()
 
@@ -218,9 +224,11 @@ def _run_daemon(config_path: Path) -> None:
         web_server.server_close()
     if tray_thread:
         tray_thread.join(timeout=1)
-    _finalize_transcript(state, config, update_state)
+    mixed_text = _finalize_transcript(state, config, update_state, notify_icon)
     if include_output:
         _finalize_output_transcript(state, update_state)
+    _cleanup_retranscribed_dirs(state, update_state)
+    _archive_transcripts(state, config, mixed_text, update_state)
     update_state(status="stopped", stopped_at=_now_iso())
     if notify_icon:
         send_notification("Whisperflow", "Recording stopped.", icon=notify_icon)
@@ -233,6 +241,7 @@ def _build_state(config: dict[str, Any]) -> dict[str, Any]:
     live = config["live_capture"]
     audio = live["audio"]
     output_dir = Path(config["output_dir"])
+    archive_root = _archive_root(config)
     raw_path = output_dir / live["raw_transcript_filename"]
     final_path = output_dir / live["final_transcript_filename"]
     output_raw_path = output_dir / live["output_raw_transcript_filename"]
@@ -243,6 +252,7 @@ def _build_state(config: dict[str, Any]) -> dict[str, Any]:
         "started_at": _now_iso(),
         "stopped_at": None,
         "output_dir": str(output_dir),
+        "archive_dir": str(archive_root),
         "raw_transcript_path": str(raw_path),
         "final_transcript_path": str(final_path),
         "output_raw_transcript_path": str(output_raw_path),
@@ -258,26 +268,88 @@ def _build_state(config: dict[str, Any]) -> dict[str, Any]:
         "output_format": config["output_format"],
         "web_url": None,
         "web_error": None,
+        "archive_web_url": None,
+        "archive_web_error": None,
         "output_error": None,
+        "last_archive_dir": None,
         "last_error": None,
     }
 
 
+def _maybe_unload_ollama_models(config: dict[str, Any]) -> None:
+    mixing_config = config.get("mixing", {})
+    if not isinstance(mixing_config, dict):
+        return
+    if not mixing_config.get("enabled", True):
+        return
+    if not mixing_config.get("unload_on_start", True):
+        return
+
+    unloaded = unload_ollama_models()
+    if unloaded:
+        logger.info("Unloaded Ollama models before capture: %s", ", ".join(unloaded))
+
+
 def _finalize_transcript(
-    state: dict[str, Any], config: dict[str, Any], update_state: Any
-) -> None:
+    state: dict[str, Any],
+    config: dict[str, Any],
+    update_state: Any,
+    notify_icon: str | None,
+) -> str:
     raw_path = Path(state["raw_transcript_path"])
     final_path = Path(state["final_transcript_path"])
+    output_raw_path = Path(state.get("output_raw_transcript_path", ""))
+
     try:
-        if raw_path.exists():
-            content = raw_path.read_text(encoding="utf-8")
-        else:
-            content = ""
-        write_transcript(content, str(final_path))
+        raw_content = raw_path.read_text(encoding="utf-8") if raw_path.exists() else ""
+    except OSError as exc:
+        update_state(last_error=f"Failed to read raw transcript: {exc}")
+        raw_content = ""
+
+    input_lines = [line for line in raw_content.splitlines() if line.strip()]
+
+    output_lines: list[str] = []
+    if output_raw_path and output_raw_path.exists():
+        try:
+            output_lines = [
+                line
+                for line in output_raw_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except OSError as exc:
+            update_state(output_error=f"Failed to read output transcript: {exc}")
+
+    mixing_config = config.get("mixing", {})
+    mixing_enabled = True
+    model_name = "glm-4.7-flash:latest"
+    if isinstance(mixing_config, dict):
+        mixing_enabled = mixing_config.get("enabled", True)
+        model_name = mixing_config.get("ollama_model", model_name)
+
+    if mixing_enabled:
+        send_notification("Whisperflow", "Ollama mixing started.", icon=notify_icon)
+        mix_stop = threading.Event()
+        start_tray_indicator(mix_stop, tooltip="Ollama mixing", icon_name="mix")
+        try:
+            mixed_text = mix_with_ollama(input_lines, output_lines, model_name)
+            if not mixed_text:
+                mixed_text = merge_lines_fallback(input_lines, output_lines)
+        except WhisperflowRuntimeError as exc:
+            update_state(last_error=str(exc))
+            mixed_text = merge_lines_fallback(input_lines, output_lines)
+        finally:
+            mix_stop.set()
+            send_notification("Whisperflow", "Ollama mixing finished.", icon=notify_icon)
+    else:
+        mixed_text = merge_lines_fallback(input_lines, output_lines)
+
+    try:
+        write_transcript(mixed_text, str(final_path))
         update_state(finalized_at=_now_iso())
-        _copy_final_transcript(content, config)
+        _copy_final_transcript(mixed_text, config)
     except OSError as exc:
         update_state(status="error", last_error=f"Failed to finalize transcript: {exc}")
+    return mixed_text
 
 
 def _finalize_output_transcript(state: dict[str, Any], update_state: Any) -> None:
@@ -306,6 +378,85 @@ def _copy_final_transcript(text: str, config: dict[str, Any]) -> None:
         return
     tool = clipboard.get("tool", "auto")
     copy_to_clipboard(text, tool=tool)
+
+
+def _archive_transcripts(
+    state: dict[str, Any],
+    config: dict[str, Any],
+    mixed_text: str,
+    update_state: Any,
+) -> None:
+    archive_config = config.get("archive", {})
+    if not isinstance(archive_config, dict) or not archive_config.get("enabled", False):
+        return
+
+    archive_root = _archive_root(config)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_dir = archive_root / timestamp
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        final_name = config["live_capture"]["final_transcript_filename"]
+        write_transcript(mixed_text, str(archive_dir / final_name))
+        _copy_if_exists(Path(state["raw_transcript_path"]), archive_dir)
+        if state.get("include_output", False):
+            _copy_if_exists(
+                Path(state.get("output_raw_transcript_path", "")), archive_dir
+            )
+            _copy_if_exists(
+                Path(state.get("output_final_transcript_path", "")), archive_dir
+            )
+        _copy_dir_if_exists(
+            Path(state["output_dir"]) / "live_segments" / "retranscribed", archive_dir
+        )
+        _copy_dir_if_exists(
+            Path(state["output_dir"]) / "live_output_segments" / "retranscribed",
+            archive_dir,
+        )
+        update_state(last_archive_dir=str(archive_dir))
+    except OSError as exc:
+        update_state(last_error=f"Failed to archive transcripts: {exc}")
+
+
+def _copy_if_exists(source: Path, archive_dir: Path) -> None:
+    if not source.exists() or not source.is_file():
+        return
+    destination = archive_dir / source.name
+    destination.write_bytes(source.read_bytes())
+
+
+def _copy_dir_if_exists(source: Path, archive_dir: Path) -> None:
+    if not source.exists() or not source.is_dir():
+        return
+    destination = archive_dir / source.name
+    if destination.exists():
+        return
+    for path in source.rglob("*"):
+        if path.is_dir():
+            continue
+        relative = path.relative_to(source)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(path.read_bytes())
+
+
+def _cleanup_retranscribed_dirs(state: dict[str, Any], update_state: Any) -> None:
+    output_dir = Path(state["output_dir"])
+    candidates = [
+        output_dir / "live_segments" / "retranscribed",
+        output_dir / "live_output_segments" / "retranscribed",
+    ]
+    for path in candidates:
+        if not path.exists() or not path.is_dir():
+            continue
+        try:
+            for file_path in path.glob("*"):
+                if file_path.is_file():
+                    file_path.unlink()
+            path.rmdir()
+        except OSError as exc:
+            update_state(output_error=f"Failed to remove {path}: {exc}")
+
+
 
 
 def _install_signal_handlers(stop_event: threading.Event) -> None:
@@ -421,6 +572,14 @@ def _print_state_line(state: dict[str, Any], key: str, label: str) -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _archive_root(config: dict[str, Any]) -> Path:
+    archive_config = config.get("archive", {})
+    dir_name = "archives"
+    if isinstance(archive_config, dict):
+        dir_name = archive_config.get("dir_name", "archives")
+    return Path(config["output_dir"]) / dir_name
 
 
 def main(argv: Sequence[str] | None = None) -> int:
